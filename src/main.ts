@@ -1,10 +1,8 @@
 import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
-import {
-  DocumentBuilder,
-  SwaggerModule,
-} from '@nestjs/swagger';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
+import { PostgresExceptionFilter } from './common/filters/postgres-exception.filter';
 
 /**
  * Initializes the NestJS application.
@@ -14,6 +12,7 @@ import { AppModule } from './app.module';
  */
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule);
+
 
   /**
    * Applies validation rules to all incoming requests.
@@ -35,7 +34,13 @@ async function bootstrap(): Promise<void> {
     }),
   );
 
-   /**
+  /**
+   * Translates PostgreSQL errors (unique, foreign key, check violations...)
+   * into safe HTTP responses without leaking database details.
+   */
+  app.useGlobalFilters(new PostgresExceptionFilter());
+
+  /**
    * Configures Swagger documentation metadata.
    */
   const swaggerConfig = new DocumentBuilder()
@@ -45,23 +50,20 @@ async function bootstrap(): Promise<void> {
     )
     .setVersion('1.0')
     .addBearerAuth(
-    {
-      type: 'http',
-      scheme: 'bearer',
-      bearerFormat: 'JWT',
-      description: 'Enter your JWT access token.',
-    },
-    'access-token',
+      {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'JWT',
+        description: 'Enter your JWT access token.',
+      },
+      'access-token',
     )
     .build();
 
   /**
    * Generates the OpenAPI document from the application routes.
    */
-  const document = SwaggerModule.createDocument(
-    app,
-    swaggerConfig,
-  );
+  const document = SwaggerModule.createDocument(app, swaggerConfig);
 
   /**
    * Exposes Swagger UI at /api/docs.
@@ -71,4 +73,4 @@ async function bootstrap(): Promise<void> {
   await app.listen(process.env.PORT ?? 4000);
 }
 
-bootstrap();
+void bootstrap();

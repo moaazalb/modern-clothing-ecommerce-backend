@@ -37,7 +37,7 @@ import { SessionsModule } from '../sessions/sessions.module';
       useFactory: (configService: ConfigService) => ({
         secret: configService.getOrThrow<string>('JWT_SECRET'),
         signOptions: {
-          expiresIn: '15m',
+          expiresIn: '1d',
         },
       }),
     }),

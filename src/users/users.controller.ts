@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Delete,
+  ForbiddenException,
   Get,
   HttpCode,
   HttpStatus,
@@ -9,12 +10,14 @@ import {
   ParseUUIDPipe,
   Patch,
   Post,
+  Req,
 } from '@nestjs/common';
 
 import {
   ApiBadRequestResponse,
   ApiConflictResponse,
   ApiCreatedResponse,
+  ApiForbiddenResponse,
   ApiNoContentResponse,
   ApiNotFoundResponse,
   ApiBearerAuth,
@@ -22,6 +25,7 @@ import {
   ApiOperation,
   ApiParam,
   ApiTags,
+  ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 
 import { UsersService } from './users.service';
@@ -34,6 +38,13 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { UserRole } from './entities/user.entity';
+
+/**
+ * Authenticated request information attached by JwtStrategy.
+ */
+interface AuthenticatedRequest {
+  user: UserResponseDto & { sid: string };
+}
 
 /**
  * Users controller.
@@ -50,6 +61,27 @@ export class UsersController {
    * @param usersService Service responsible for user business logic.
    */
   constructor(private readonly usersService: UsersService) {}
+
+  /**
+   * Allows access only to the account owner or to an administrator.
+   *
+   * @param request Authenticated request.
+   * @param targetUserId UUID of the account being accessed.
+   * @throws ForbiddenException If the caller is neither the owner nor an admin.
+   */
+  private assertSelfOrAdmin(
+    request: AuthenticatedRequest,
+    targetUserId: string,
+  ): void {
+    const isOwner = request.user.id === targetUserId;
+    const isAdmin = request.user.role === UserRole.ADMIN;
+
+    if (!isOwner && !isAdmin) {
+      throw new ForbiddenException(
+        'You do not have permission to access this account.',
+      );
+    }
+  }
 
   /**
    * Creates a new user account.
@@ -107,13 +139,17 @@ export class UsersController {
    *
    * GET /users/:id
    *
+   * @param request Authenticated request.
    * @param id User UUID.
    * @returns The requested user.
    */
   @Get(':id')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('access-token')
   @ApiOperation({
     summary: 'Get a user by ID',
-    description: 'Retrieves a specific user using their UUID.',
+    description:
+      'Retrieves a specific user using their UUID. Allowed for the account owner or an administrator.',
   })
   @ApiParam({
     name: 'id',
@@ -127,12 +163,22 @@ export class UsersController {
   @ApiBadRequestResponse({
     description: 'Invalid UUID format.',
   })
+  @ApiUnauthorizedResponse({
+    description: 'Missing or invalid access token.',
+  })
+  @ApiForbiddenResponse({
+    description:
+      'The caller is neither the account owner nor an administrator.',
+  })
   @ApiNotFoundResponse({
     description: 'User not found.',
   })
   findOne(
+    @Req() request: AuthenticatedRequest,
     @Param('id', new ParseUUIDPipe()) id: string,
   ): Promise<UserResponseDto> {
+    this.assertSelfOrAdmin(request, id);
+
     return this.usersService.findOne(id);
   }
 
@@ -141,14 +187,18 @@ export class UsersController {
    *
    * PATCH /users/:id
    *
+   * @param request Authenticated request.
    * @param id User UUID.
    * @param updateUserDto Optional fields to update.
    * @returns The updated user.
    */
   @Patch(':id')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth('access-token')
   @ApiOperation({
     summary: 'Update a user',
-    description: 'Updates the specified user account.',
+    description:
+      'Updates the specified user account. Allowed for the account owner or an administrator.',
   })
   @ApiParam({
     name: 'id',
@@ -161,6 +211,13 @@ export class UsersController {
   @ApiBadRequestResponse({
     description: 'Invalid UUID or input data.',
   })
+  @ApiUnauthorizedResponse({
+    description: 'Missing or invalid access token.',
+  })
+  @ApiForbiddenResponse({
+    description:
+      'The caller is neither the account owner nor an administrator.',
+  })
   @ApiNotFoundResponse({
     description: 'User not found.',
   })
@@ -168,9 +225,12 @@ export class UsersController {
     description: 'The email address is already in use.',
   })
   update(
+    @Req() request: AuthenticatedRequest,
     @Param('id', new ParseUUIDPipe()) id: string,
     @Body() updateUserDto: UpdateUserDto,
   ): Promise<UserResponseDto> {
+    this.assertSelfOrAdmin(request, id);
+
     return this.usersService.update(id, updateUserDto);
   }
 
@@ -182,10 +242,13 @@ export class UsersController {
    * @param id User UUID.
    */
   @Delete(':id')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @ApiBearerAuth('access-token')
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({
     summary: 'Delete a user',
-    description: 'Permanently deletes the specified user account.',
+    description: 'Permanently deletes the specified user account. Admin only.',
   })
   @ApiParam({
     name: 'id',
@@ -196,6 +259,12 @@ export class UsersController {
   })
   @ApiBadRequestResponse({
     description: 'Invalid UUID format.',
+  })
+  @ApiUnauthorizedResponse({
+    description: 'Missing or invalid access token.',
+  })
+  @ApiForbiddenResponse({
+    description: 'Administrator role required.',
   })
   @ApiNotFoundResponse({
     description: 'User not found.',

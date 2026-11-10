@@ -13,6 +13,7 @@ import { User } from './entities/user.entity';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { UserResponseDto } from './dto/user-response.dto';
+import { assertNoNullFields } from '../common/utils/assert-no-null-fields.util';
 
 /**
  * Users service.
@@ -129,15 +130,17 @@ export class UsersService {
     return this.toResponseDto(user);
   }
 
-  /**
+ /**
    * Updates an existing user's information.
    *
+   * Rejects null for every field except avatar (the only nullable column).
    * Hashes the password if a new password is provided.
    * Checks email uniqueness before saving.
    *
    * @param id User UUID.
    * @param updateUserDto Fields to update.
    * @returns The updated user without the password.
+   * @throws BadRequestException If a non-nullable field is null.
    * @throws NotFoundException If the user does not exist.
    * @throws ConflictException If the new email is already in use.
    */
@@ -145,6 +148,8 @@ export class UsersService {
     id: string,
     updateUserDto: UpdateUserDto,
   ): Promise<UserResponseDto> {
+    assertNoNullFields(updateUserDto, ['avatar']);
+
     const user = await this.findUserEntity(id);
 
     const updateData = { ...updateUserDto };
