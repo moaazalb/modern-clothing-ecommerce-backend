@@ -111,6 +111,7 @@ import { StorageProvider } from './storage/storage.provider';
     SizeService,
     StockService,
     TagService,
+    StorageProvider,
   ],
 })
 export class ProductsModule {}

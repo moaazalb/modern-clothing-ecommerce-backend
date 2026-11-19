@@ -1,18 +1,59 @@
 import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import cookieParser from 'cookie-parser';
+import { NestExpressApplication } from '@nestjs/platform-express';
+import { join } from 'node:path';
+
 import { AppModule } from './app.module';
 import { PostgresExceptionFilter } from './common/filters/postgres-exception.filter';
 
 /**
  * Initializes the NestJS application.
  *
- * Configures global request validation and starts
- * the HTTP server on the configured port.
+ * Configures request validation, cookie parsing, CORS,
+ * global exception handling, Swagger documentation,
+ * and starts the HTTP server.
  */
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    rawBody: true,
+  });
 
+  /**
+   * Serves uploaded product images as public static files.
+   *
+   * Maps the local uploads directory to the /uploads URL prefix.
+   */
+  app.useStaticAssets(join(process.cwd(), 'uploads'), {
+    prefix: '/uploads',
+  });
+
+  /**
+   * Parses incoming cookies and attaches them to the request.
+   *
+   * This allows authentication endpoints to access
+   * the HttpOnly refresh token cookie.
+   */
+  app.use(cookieParser());
+
+  /**
+   * Enables cross-origin requests from the frontend.
+   *
+   * Credentials are required for the browser to send
+   * and receive authentication cookies.
+   */
+  app.enableCors({
+    origin: [
+      'http://localhost:3000',
+      'http://localhost:3001',
+      'http://127.0.0.1:3000',
+      'http://127.0.0.1:3001',
+      'http://192.168.31.1:3000',
+      'http://192.168.31.1:3001'   
+    ],
+    credentials: true,
+  });
 
   /**
    * Applies validation rules to all incoming requests.
@@ -35,8 +76,7 @@ async function bootstrap(): Promise<void> {
   );
 
   /**
-   * Translates PostgreSQL errors (unique, foreign key, check violations...)
-   * into safe HTTP responses without leaking database details.
+   * Translates PostgreSQL errors into safe HTTP responses.
    */
   app.useGlobalFilters(new PostgresExceptionFilter());
 
@@ -61,7 +101,7 @@ async function bootstrap(): Promise<void> {
     .build();
 
   /**
-   * Generates the OpenAPI document from the application routes.
+   * Generates the OpenAPI document from application routes.
    */
   const document = SwaggerModule.createDocument(app, swaggerConfig);
 
@@ -70,7 +110,7 @@ async function bootstrap(): Promise<void> {
    */
   SwaggerModule.setup('api/docs', app, document);
 
-  await app.listen(process.env.PORT ?? 4000);
+  await app.listen(process.env.PORT ?? 4000, '0.0.0.0');
 }
 
 void bootstrap();
