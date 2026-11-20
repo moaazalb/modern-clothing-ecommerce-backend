@@ -2,18 +2,18 @@ import {
   ConflictException,
   Injectable,
   NotFoundException,
-  UnauthorizedException,
 } from '@nestjs/common';
 
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import * as bcrypt from 'bcrypt';
 
+import { assertNoNullFields } from '../common/utils/assert-no-null-fields.util';
+import { SessionsService } from '../sessions/sessions.service';
 import { User } from './entities/user.entity';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { UserResponseDto } from './dto/user-response.dto';
-import { assertNoNullFields } from '../common/utils/assert-no-null-fields.util';
 
 /**
  * Users service.
@@ -26,10 +26,12 @@ export class UsersService {
    * Injects the User repository to interact with the users table.
    *
    * @param usersRepository TypeORM repository for User entities.
+   * @param sessionsService Ends the other sessions after a credentials change.
    */
   constructor(
     @InjectRepository(User)
     private readonly usersRepository: Repository<User>,
+    private readonly sessionsService: SessionsService,
   ) {}
 
   /**
@@ -130,15 +132,21 @@ export class UsersService {
     return this.toResponseDto(user);
   }
 
- /**
+  /**
    * Updates an existing user's information.
    *
    * Rejects null for every field except avatar (the only nullable column).
    * Hashes the password if a new password is provided.
    * Checks email uniqueness before saving.
    *
+   * When the password or the email changes, the user's other sessions are
+   * ended in the same transaction: a thief who holds an old session is
+   * logged out. The session in keepSessionId (the device that made the
+   * change) stays logged in.
+   *
    * @param id User UUID.
    * @param updateUserDto Fields to update.
+   * @param keepSessionId Session to keep when the credentials change (omit to end all of them, e.g. when an admin edits another user).
    * @returns The updated user without the password.
    * @throws BadRequestException If a non-nullable field is null.
    * @throws NotFoundException If the user does not exist.
@@ -147,6 +155,7 @@ export class UsersService {
   async update(
     id: string,
     updateUserDto: UpdateUserDto,
+    keepSessionId?: string,
   ): Promise<UserResponseDto> {
     assertNoNullFields(updateUserDto, ['avatar']);
 
@@ -174,9 +183,30 @@ export class UsersService {
       updateData.password = await bcrypt.hash(updateData.password, 12);
     }
 
+    /**
+     * Must be computed before merge(), which overwrites the current values.
+     */
+    const credentialsChanged =
+      !!updateData.password ||
+      (updateData.email !== undefined && updateData.email !== user.email);
+
     const updatedUser = this.usersRepository.merge(user, updateData);
 
-    const savedUser = await this.usersRepository.save(updatedUser);
+    const savedUser = await this.usersRepository.manager.transaction(
+      async (manager) => {
+        const saved = await manager.save(User, updatedUser);
+
+        if (credentialsChanged) {
+          await this.sessionsService.revokeOtherSessions(
+            id,
+            keepSessionId,
+            manager,
+          );
+        }
+
+        return saved;
+      },
+    );
 
     return this.toResponseDto(savedUser);
   }

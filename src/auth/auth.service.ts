@@ -1,15 +1,25 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createHash, randomUUID, timingSafeEqual } from 'crypto';
-import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
-import { DataSource } from 'typeorm';
+import { randomUUID } from 'node:crypto';
+import { DataSource, EntityManager } from 'typeorm';
 
+import { SessionsService } from '../sessions/sessions.service';
+import { UserResponseDto } from '../users/dto/user-response.dto';
 import { User } from '../users/entities/user.entity';
 import { UsersService } from '../users/users.service';
-import { UserResponseDto } from '../users/dto/user-response.dto';
+import {
+  BCRYPT_ROUNDS,
+  MAX_IP_ADDRESS_LENGTH,
+  MAX_USER_AGENT_LENGTH,
+  REFRESH_REUSE_GRACE_SECONDS,
+  REFRESH_TOKEN_TTL_MS,
+} from './constants/auth.constants';
 import { LoginDto } from './dto/login.dto';
-import { SessionsService } from '../sessions/sessions.service';
+import { RefreshTokenMismatchException } from './exceptions/refresh-token-mismatch.exception';
+import { TokenService } from './token.service';
+import { TokenPayload } from './types/token-payload.type';
+import { readMaxActiveSessions } from './utils/auth-config.util';
 
 /**
  * Contains device information associated with a login request.
@@ -20,130 +30,86 @@ interface LoginMetadata {
 }
 
 /**
+ * Result of a successful login.
+ */
+interface LoginResult {
+  accessToken: string;
+  refreshToken: string;
+  user: UserResponseDto;
+}
+
+/**
+ * Result of a successful token refresh. refreshToken is null when only a
+ * new access token was issued (the harmless two-tab race): the cookie must
+ * then be left as it is.
+ */
+interface RefreshResult {
+  accessToken: string;
+  refreshToken: string | null;
+}
+
+/**
+ * What a refresh transaction decided.
+ *
+ * rotated: the normal case, the refresh token was replaced.
+ * grace: the previous token was used right after a rotation (two tabs).
+ * reuse: the previous token was used too late: theft, the session was revoked.
+ */
+type RefreshOutcome =
+  | { kind: 'rotated'; accessToken: string; refreshToken: string }
+  | { kind: 'grace'; accessToken: string }
+  | { kind: 'reuse' };
+
+/**
  * Authentication service.
  *
- * Handles user login, password verification,
- * and JWT access token generation.
+ * Handles login, token refresh with rotation and theft detection, and
+ * logout. Token details live in TokenService, session storage in
+ * SessionsService, and the cookie in AuthController.
  */
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
+  /**
+   * A valid bcrypt hash of a random value, created once at startup.
+   * When the email is unknown, the password is compared with it anyway, so
+   * unknown and known emails take the same time to answer.
+   */
+  private readonly dummyPasswordHash = bcrypt.hashSync(
+    randomUUID(),
+    BCRYPT_ROUNDS,
+  );
+
+  private readonly maxActiveSessions: number;
+
   /**
    * Injects the required authentication dependencies.
    *
    * @param usersService Handles user database operations.
-   * @param jwtService Handles JWT token generation.
+   * @param tokenService Creates and verifies tokens.
+   * @param dataSource Opens the transactions used to create sessions and rotate tokens.
+   * @param sessionsService Stores and reads authentication sessions.
+   * @param configService Provides MAX_ACTIVE_SESSIONS.
    */
   constructor(
     private readonly usersService: UsersService,
-    private readonly jwtService: JwtService,
-    private readonly configService: ConfigService,
+    private readonly tokenService: TokenService,
     private readonly dataSource: DataSource,
     private readonly sessionsService: SessionsService,
-  ) {}
+    configService: ConfigService,
+  ) {
+    this.maxActiveSessions = readMaxActiveSessions(configService);
+  }
 
   /**
-   * Authenticates a user using email and password.
+   * Converts a User entity into the public user data.
    *
-   * @param loginDto User login credentials.
-   * @returns JWT access token and safe user information.
-   * @throws UnauthorizedException If credentials are invalid
-   * or the account is inactive.
+   * @param user User entity.
+   * @returns Public user information (no password).
    */
-  async login(
-    loginDto: LoginDto,
-    metadata: LoginMetadata,
-  ): Promise<{
-    accessToken: string;
-    refreshToken: string;
-    user: UserResponseDto;
-  }> {
-    const email = loginDto.email.trim().toLowerCase();
-
-    /**
-     * Retrieves the user together with the password hash.
-     */
-    const user = await this.usersService.findByEmailForAuth(email);
-
-    if (!user) {
-      throw new UnauthorizedException('Invalid email or password.');
-    }
-
-    /**
-     * Compares the submitted password with the stored hash.
-     */
-    const isPasswordValid = await bcrypt.compare(
-      loginDto.password,
-      user.password,
-    );
-
-    if (!isPasswordValid) {
-      throw new UnauthorizedException('Invalid email or password.');
-    }
-
-    /**
-     * Prevents inactive accounts from accessing the application.
-     */
-    if (!user.isActive) {
-      throw new UnauthorizedException('This account is inactive.');
-    }
-
-    /**
-     * Generates a unique identifier for this authentication session.
-     */
-    const sessionId = randomUUID();
-
-    /**
-     * Creates the JWT payload.
-     *
-     * The sub claim represents the authenticated user's ID.
-     * The sid claim identifies the current authentication session.
-     */
-    const payload = {
-      sub: user.id,
-      email: user.email,
-      role: user.role,
-      sid: sessionId,
-    };
-
-    /**
-     * Generates a short-lived access token.
-     */
-    const accessToken = await this.jwtService.signAsync(payload);
-
-    /**
-     * Generates a long-lived refresh token using a separate secret.
-     */
-    const refreshToken = await this.jwtService.signAsync(payload, {
-      secret: this.configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
-      expiresIn: '7d',
-    });
-
-    /**
-     * Hashes the refresh token before storing it in the database.
-     */
-    const refreshTokenHash = this.hashRefreshToken(refreshToken);
-
-    /**
-     * Calculates the refresh token expiration date.
-     */
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-
-    /**
-     * Creates a separate database session for this login.
-     */
-    await this.sessionsService.createSession(
-      sessionId,
-      user.id,
-      refreshTokenHash,
-      expiresAt,
-      metadata.userAgent,
-      metadata.ipAddress,
-    );
-
-    /**
-     * Returns only public user information.
-     */
-    const userResponse: UserResponseDto = {
+  private toUserResponse(user: User): UserResponseDto {
+    return {
       id: user.id,
       firstName: user.firstName,
       lastName: user.lastName,
@@ -154,239 +120,261 @@ export class AuthService {
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
     };
+  }
 
+  /**
+   * Builds the content of the tokens of a session.
+   *
+   * @param user The authenticated user.
+   * @param sessionId Session identifier.
+   * @returns The token payload.
+   */
+  private buildPayload(user: User, sessionId: string): TokenPayload {
     return {
-      accessToken,
-      refreshToken,
-      user: userResponse,
+      sub: user.id,
+      email: user.email,
+      role: user.role,
+      sid: sessionId,
     };
   }
 
   /**
-   * Refreshes authentication tokens using a database transaction
-   * and pessimistic write lock to prevent concurrent token reuse.
+   * Cuts the device information to the stored sizes, so a very long
+   * header can never make a login fail.
+   *
+   * @param metadata Device information from the request.
+   * @returns The shortened device information.
+   */
+  private sanitizeMetadata(metadata: LoginMetadata): LoginMetadata {
+    return {
+      userAgent: metadata.userAgent
+        ? metadata.userAgent.slice(0, MAX_USER_AGENT_LENGTH)
+        : null,
+      ipAddress: metadata.ipAddress
+        ? metadata.ipAddress.slice(0, MAX_IP_ADDRESS_LENGTH)
+        : null,
+    };
+  }
+
+  /**
+   * Authenticates a user using email and password and creates a session.
+   *
+   * The password is always compared with a hash (a dummy one when the
+   * email is unknown), so the response time does not reveal which emails
+   * are registered. When the user already has the maximum number of active
+   * sessions, the oldest ones are revoked.
+   *
+   * @param loginDto User login credentials.
+   * @param metadata Device information of the request.
+   * @returns Access token, refresh token and safe user information.
+   * @throws UnauthorizedException If credentials are invalid or the account is inactive.
+   */
+  async login(
+    loginDto: LoginDto,
+    metadata: LoginMetadata,
+  ): Promise<LoginResult> {
+    const email = loginDto.email.trim().toLowerCase();
+
+    const user = await this.usersService.findByEmailForAuth(email);
+
+    const isPasswordValid = await bcrypt.compare(
+      loginDto.password,
+      user?.password ?? this.dummyPasswordHash,
+    );
+
+    if (!user || !isPasswordValid) {
+      throw new UnauthorizedException('Invalid email or password.');
+    }
+
+    /**
+     * Prevents inactive accounts from accessing the application.
+     */
+    if (!user.isActive) {
+      throw new UnauthorizedException('This account is inactive.');
+    }
+
+    const sessionId = randomUUID();
+    const payload = this.buildPayload(user, sessionId);
+
+    const accessToken = await this.tokenService.signAccessToken(payload);
+    const refreshToken = await this.tokenService.signRefreshToken(payload);
+
+    const { userAgent, ipAddress } = this.sanitizeMetadata(metadata);
+
+    await this.dataSource.transaction(async (manager) => {
+      await this.sessionsService.createSession(
+        sessionId,
+        user.id,
+        this.tokenService.hashRefreshToken(refreshToken),
+        new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
+        userAgent,
+        ipAddress,
+        manager,
+      );
+
+      await this.sessionsService.pruneExcessSessions(
+        user.id,
+        this.maxActiveSessions,
+        manager,
+      );
+    });
+
+    return { accessToken, refreshToken, user: this.toUserResponse(user) };
+  }
+
+  /**
+   * Decides what to do with a refresh token, with the session row locked.
+   *
+   * - the token is the current one: rotate it;
+   * - the token is the previous one and the rotation happened seconds ago: a harmless race, only a new access token is issued;
+   * - the token is the previous one and the rotation is older: the token was stolen or replayed, the whole session is revoked;
+   * - the token matches neither: it is simply refused.
+   *
+   * @param manager Entity manager of the running transaction.
+   * @param payload The verified content of the refresh token.
+   * @param refreshToken The submitted refresh token.
+   * @returns What was decided (a revoked session is committed, not rolled back).
+   * @throws UnauthorizedException If the session is missing, revoked, expired, or its user is inactive.
+   * @throws RefreshTokenMismatchException If the token matches neither the current nor the previous one.
+   */
+  private async processRefresh(
+    manager: EntityManager,
+    payload: TokenPayload,
+    refreshToken: string,
+  ): Promise<RefreshOutcome> {
+    const session = await this.sessionsService.findSessionByIdForUpdate(
+      payload.sid,
+      manager,
+    );
+
+    if (
+      !session ||
+      session.userId !== payload.sub ||
+      session.revokedAt ||
+      session.expiresAt <= new Date() ||
+      !session.refreshTokenHash
+    ) {
+      throw new UnauthorizedException('Invalid refresh token.');
+    }
+
+    const user = session.user;
+
+    if (!user || !user.isActive) {
+      throw new UnauthorizedException('Invalid refresh token.');
+    }
+
+    /**
+     * The new tokens use current user information and keep the session id.
+     */
+    const newPayload = this.buildPayload(user, session.id);
+
+    if (this.tokenService.matchesHash(refreshToken, session.refreshTokenHash)) {
+      const accessToken = await this.tokenService.signAccessToken(newPayload);
+      const newRefreshToken =
+        await this.tokenService.signRefreshToken(newPayload);
+
+      await this.sessionsService.rotateRefreshToken(
+        session.id,
+        this.tokenService.hashRefreshToken(newRefreshToken),
+        session.refreshTokenHash,
+        manager,
+      );
+
+      return { kind: 'rotated', accessToken, refreshToken: newRefreshToken };
+    }
+
+    if (
+      session.previousRefreshTokenHash &&
+      session.rotatedAt &&
+      this.tokenService.matchesHash(
+        refreshToken,
+        session.previousRefreshTokenHash,
+      )
+    ) {
+      const ageMs = Date.now() - session.rotatedAt.getTime();
+
+      if (ageMs <= REFRESH_REUSE_GRACE_SECONDS * 1000) {
+        return {
+          kind: 'grace',
+          accessToken: await this.tokenService.signAccessToken(newPayload),
+        };
+      }
+
+      await this.sessionsService.revokeSession(session.id, new Date(), manager);
+
+      return { kind: 'reuse' };
+    }
+
+    throw new RefreshTokenMismatchException();
+  }
+
+  /**
+   * Renews the tokens of a session. The refresh token is rotated: the new
+   * one replaces the old one. Validation and rotation run in one
+   * transaction with the session row locked, so two requests with the same
+   * token can never both rotate it.
    *
    * @param refreshToken Current refresh token.
-   * @returns Newly generated access and refresh tokens.
-   * @throws UnauthorizedException If the refresh token is invalid or expired.
+   * @returns The new access token, and the new refresh token (null when only the access token was issued).
+   * @throws UnauthorizedException If the token or its session is not valid, or the token was stolen (the session is revoked).
+   * @throws RefreshTokenMismatchException If the token is an old one that is neither the current nor the previous.
    */
-  async refresh(refreshToken: string): Promise<{
-    accessToken: string;
-    refreshToken: string;
-  }> {
-    try {
-      /**
-       * Verifies the refresh token using its dedicated secret.
-       */
-      const payload = await this.jwtService.verifyAsync<{
-        sub: string;
-        email: string;
-        role: string;
-        sid: string;
-      }>(refreshToken, {
-        secret: this.configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
-      });
+  async refresh(refreshToken: string): Promise<RefreshResult> {
+    const payload = await this.tokenService.verifyRefreshToken(refreshToken);
 
-      if (!payload.sid) {
-        throw new UnauthorizedException('Invalid refresh token.');
-      }
+    const outcome = await this.dataSource.transaction((manager) =>
+      this.processRefresh(manager, payload, refreshToken),
+    );
 
-      /**
-       * Executes token validation and rotation inside one transaction.
-       */
-      return await this.dataSource.transaction(async (manager) => {
-        /**
-         * Retrieves and locks the session row to prevent concurrent refresh operations.
-         */
-        const session = await this.sessionsService.findSessionByIdForUpdate(
-          payload.sid,
-          manager,
-        );
-
-        if (
-          !session ||
-          session.userId !== payload.sub ||
-          session.revokedAt ||
-          session.expiresAt <= new Date() ||
-          !session.refreshTokenHash
-        ) {
-          throw new UnauthorizedException('Invalid refresh token.');
-        }
-
-        const user = session.user;
-
-        if (!user || !user.isActive) {
-          throw new UnauthorizedException('Invalid refresh token.');
-        }
-
-        /**
-         * Compares the submitted refresh token with the stored SHA-256 hash.
-         */
-        const submittedTokenHash = Buffer.from(
-          this.hashRefreshToken(refreshToken),
-          'hex',
-        );
-
-        const storedTokenHash = Buffer.from(session.refreshTokenHash, 'hex');
-
-        const isTokenValid =
-          submittedTokenHash.length === storedTokenHash.length &&
-          timingSafeEqual(submittedTokenHash, storedTokenHash);
-
-        if (!isTokenValid) {
-          throw new UnauthorizedException('Invalid refresh token.');
-        }
-
-        /**
-         * Creates a new JWT payload using current user information
-         * while preserving the current session identifier.
-         */
-        const newPayload = {
-          sub: user.id,
-          email: user.email,
-          role: user.role,
-          sid: session.id,
-        };
-
-        /**
-         * Generates a new access token.
-         */
-        const accessToken = await this.jwtService.signAsync(newPayload);
-
-        /**
-         * Generates a new refresh token.
-         */
-        const newRefreshToken = await this.jwtService.signAsync(newPayload, {
-          secret: this.configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
-          expiresIn: '7d',
-        });
-
-        /**
-         * Hashes the new refresh token before storing it.
-         */
-        const newRefreshTokenHash = this.hashRefreshToken(newRefreshToken);
-
-        /**
-         * Updates the refresh token hash within the current transaction.
-         */
-        await this.sessionsService.updateRefreshTokenHash(
-          session.id,
-          newRefreshTokenHash,
-          manager,
-        );
-
-        return {
-          accessToken,
-          refreshToken: newRefreshToken,
-        };
-      });
-    } catch (error) {
-      /**
-       * Prevents exposing token verification or database details.
-       */
-      if (error instanceof UnauthorizedException) {
-        throw error;
-      }
-
-      throw new UnauthorizedException('Invalid or expired refresh token.');
-    }
-  }
-
-  /**
-   * Creates a SHA-256 hash of a refresh token.
-   *
-   * @param token Raw refresh token.
-   * @returns SHA-256 hash in hexadecimal format.
-   */
-  private hashRefreshToken(token: string): string {
-    return createHash('sha256').update(token).digest('hex');
-  }
-
-  /**
-   * Logs out a user by invalidating their current authentication session.
-   *
-   * A pessimistic write lock prevents concurrent refresh/logout
-   * operations from modifying the same session simultaneously.
-   *
-   * @param refreshToken - The refresh token to invalidate.
-   * @returns A success message.
-   * @throws UnauthorizedException if the refresh token is invalid or expired.
-   */
-  async logout(refreshToken: string): Promise<{ message: string }> {
-    try {
-      /**
-       * Verifies the refresh token signature and expiration.
-       */
-      const payload = await this.jwtService.verifyAsync<{
-        sub: string;
-        sid: string;
-      }>(refreshToken, {
-        secret: this.configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
-      });
-
-      if (!payload.sid) {
-        throw new UnauthorizedException('Invalid refresh token.');
-      }
-
-      return await this.dataSource.transaction(async (manager) => {
-        /**
-         * Retrieves and locks the current session.
-         */
-        const session = await this.sessionsService.findSessionByIdForUpdate(
-          payload.sid,
-          manager,
-        );
-
-        if (
-          !session ||
-          session.userId !== payload.sub ||
-          session.revokedAt ||
-          session.expiresAt <= new Date() ||
-          !session.refreshTokenHash
-        ) {
-          throw new UnauthorizedException('Invalid refresh token.');
-        }
-
-        /**
-         * Hashes the submitted refresh token using SHA-256.
-         */
-        const submittedHashBuffer = Buffer.from(
-          this.hashRefreshToken(refreshToken),
-          'hex',
-        );
-
-        const storedHashBuffer = Buffer.from(session.refreshTokenHash, 'hex');
-
-        /**
-         * Compares hashes safely to prevent timing attacks.
-         */
-        const isTokenValid =
-          storedHashBuffer.length === submittedHashBuffer.length &&
-          timingSafeEqual(storedHashBuffer, submittedHashBuffer);
-
-        if (!isTokenValid) {
-          throw new UnauthorizedException('Invalid refresh token.');
-        }
-
-        /**
-         * Revokes only the current authentication session.
-         */
-        await this.sessionsService.revokeSession(
-          session.id,
-          new Date(),
-          manager,
-        );
-
-        return {
-          message: 'Logged out successfully.',
-        };
-      });
-    } catch (error) {
-      if (error instanceof UnauthorizedException) {
-        throw error;
-      }
+    if (outcome.kind === 'reuse') {
+      this.logger.warn(
+        `Refresh token reuse detected: session ${payload.sid} of user ${payload.sub} was revoked.`,
+      );
 
       throw new UnauthorizedException('Invalid refresh token.');
     }
+
+    return {
+      accessToken: outcome.accessToken,
+      refreshToken: outcome.kind === 'rotated' ? outcome.refreshToken : null,
+    };
+  }
+
+  /**
+   * Logs out the session of a refresh token. Logging out is idempotent:
+   * an invalid, expired or already revoked token also ends with success,
+   * because the result the user wants (no session) is already true.
+   *
+   * A token with a valid signature revokes its session even if it is not
+   * the current token (for example after a refresh in another tab).
+   *
+   * @param refreshToken The refresh token from the cookie.
+   * @returns A success message.
+   */
+  async logout(refreshToken: string): Promise<{ message: string }> {
+    try {
+      const payload = await this.tokenService.verifyRefreshToken(refreshToken);
+
+      await this.dataSource.transaction(async (manager) => {
+        const session = await this.sessionsService.findSessionByIdForUpdate(
+          payload.sid,
+          manager,
+        );
+
+        if (session && session.userId === payload.sub && !session.revokedAt) {
+          await this.sessionsService.revokeSession(
+            session.id,
+            new Date(),
+            manager,
+          );
+        }
+      });
+    } catch (error) {
+      if (!(error instanceof UnauthorizedException)) {
+        throw error;
+      }
+    }
+
+    return { message: 'Logged out successfully.' };
   }
 }

@@ -18,15 +18,6 @@ export class LoginResponseDto {
   accessToken: string;
 
   /**
-   * JWT refresh token used to obtain a new access token.
-   */
-  @ApiProperty({
-    description: 'JWT refresh token used to renew authentication.',
-    example: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
-  })
-  refreshToken: string;
-
-  /**
    * Public information about the authenticated user.
    */
   @ApiProperty({

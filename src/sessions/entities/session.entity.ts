@@ -1,4 +1,5 @@
 import {
+  Check,
   Column,
   CreateDateColumn,
   Entity,
@@ -17,9 +18,15 @@ import { User } from '../../users/entities/user.entity';
  * hashed refresh token.
  *
  * A user can have multiple active sessions across devices.
+ *
+ * The database guarantees that a revoked session holds no token hash.
  */
 @Entity('user_sessions')
 @Index(['userId'])
+@Check(
+  'chk_user_sessions_revoked_hashes',
+  `"revokedAt" IS NULL OR ("refreshTokenHash" IS NULL AND "previousRefreshTokenHash" IS NULL)`,
+)
 export class Session {
   /**
    * Unique identifier for each session.
@@ -44,7 +51,7 @@ export class Session {
   user: User;
 
   /**
-   * SHA-256 hash of the refresh token.
+   * SHA-256 hash of the current refresh token.
    *
    * Null when the session has been revoked.
    * Never store the original refresh token in the database.
@@ -56,6 +63,34 @@ export class Session {
     select: false,
   })
   refreshTokenHash: string | null;
+
+  /**
+   * SHA-256 hash of the refresh token that was replaced by the last
+   * rotation. It lets the refresh logic tell a harmless race between two
+   * tabs from the reuse of a stolen token.
+   *
+   * Null before the first rotation and when the session has been revoked.
+   */
+  @Column({
+    type: 'varchar',
+    length: 64,
+    nullable: true,
+    select: false,
+  })
+  previousRefreshTokenHash: string | null;
+
+  /**
+   * Date and time of the last rotation of the refresh token.
+   */
+  @Column({ type: 'timestamptz', nullable: true })
+  rotatedAt: Date | null;
+
+  /**
+   * Date and time when the session was last used to renew its tokens.
+   * It starts at the creation time.
+   */
+  @Column({ type: 'timestamptz', default: () => 'now()' })
+  lastUsedAt: Date;
 
   /**
    * Date and time when this session expires.

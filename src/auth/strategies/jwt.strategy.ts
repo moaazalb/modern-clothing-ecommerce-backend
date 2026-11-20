@@ -8,35 +8,10 @@ import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 
-import { UsersService } from '../../users/users.service';
-import { UserResponseDto } from '../../users/dto/user-response.dto';
-import { User } from '../../users/entities/user.entity';
 import { SessionsService } from '../../sessions/sessions.service';
-
-/**
- * Defines the structure of the JWT payload.
- */
-interface JwtPayload {
-  /**
-   * Authenticated user's unique identifier.
-   */
-  sub: string;
-
-  /**
-   * User's email address.
-   */
-  email: string;
-
-  /**
-   * User's authorization role at token creation time.
-   */
-  role: User['role'];
-
-  /**
-   * Authentication session identifier.
-   */
-  sid: string;
-}
+import { UsersService } from '../../users/users.service';
+import { AuthenticatedUser } from '../types/authenticated-user.type';
+import { TokenPayload } from '../types/token-payload.type';
 
 /**
  * JWT authentication strategy.
@@ -82,15 +57,16 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   /**
    * Validates the JWT payload after signature verification.
    *
+   * The session and the user are read from the database on every request,
+   * so a revoked session, a disabled account or a changed role takes
+   * effect immediately, even for an access token that has not expired.
    * Passport attaches the returned value to request.user.
    *
    * @param payload Decoded JWT payload.
-   * @returns Authenticated user's public information.
+   * @returns Authenticated user's public information and the session id.
    * @throws UnauthorizedException If the user or session is invalid.
    */
-  async validate(
-    payload: JwtPayload,
-  ): Promise<UserResponseDto & { sid: string }> {
+  async validate(payload: TokenPayload): Promise<AuthenticatedUser> {
     try {
       if (!payload.sid) {
         throw new UnauthorizedException('Invalid authentication token.');
@@ -118,7 +94,15 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       }
 
       return {
-        ...user,
+        id: user.id,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        email: user.email,
+        avatar: user.avatar,
+        role: user.role,
+        isActive: user.isActive,
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt,
         sid: payload.sid,
       };
     } catch (error) {

@@ -4,6 +4,7 @@ import {
   Delete,
   ForbiddenException,
   Get,
+  Header,
   HttpCode,
   HttpStatus,
   Param,
@@ -134,6 +135,51 @@ export class UsersController {
     return this.usersService.findAll();
   }
 
+    /**
+   * Retrieves the authenticated user's own profile.
+   *
+   * GET /users/me
+   *
+   * It must be declared before GET /users/:id, otherwise the word "me"
+   * would be read as a user id and rejected by the UUID validation.
+   * JwtStrategy already read the user from the database for this request,
+   * so the data is current and no extra query is needed.
+   *
+   * @param request Authenticated request.
+   * @returns The authenticated user.
+   */
+  @Get('me')
+  @UseGuards(JwtAuthGuard)
+  @Header('Cache-Control', 'private, no-store')
+  @ApiBearerAuth('access-token')
+  @ApiOperation({
+    summary: 'Get my profile',
+    description:
+      'Returns the authenticated user. The data is read from the database on every request, so it is always current.',
+  })
+  @ApiOkResponse({
+    description: 'Profile retrieved successfully.',
+    type: UserResponseDto,
+  })
+  @ApiUnauthorizedResponse({
+    description: 'Missing or invalid access token.',
+  })
+  getMe(@Req() request: AuthenticatedRequest): UserResponseDto {
+    const user = request.user;
+
+    return {
+      id: user.id,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      email: user.email,
+      avatar: user.avatar,
+      role: user.role,
+      isActive: user.isActive,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    };
+  }
+
   /**
    * Retrieves a user by their UUID.
    *
@@ -167,8 +213,7 @@ export class UsersController {
     description: 'Missing or invalid access token.',
   })
   @ApiForbiddenResponse({
-    description:
-      'The caller is neither the account owner nor an administrator.',
+    description: 'The caller is neither the account owner nor an administrator.',
   })
   @ApiNotFoundResponse({
     description: 'User not found.',
@@ -182,10 +227,17 @@ export class UsersController {
     return this.usersService.findOne(id);
   }
 
+ 
+
   /**
    * Updates an existing user.
    *
    * PATCH /users/:id
+   *
+   * When the password or the email changes, the user's other sessions are
+   * ended. The session of the caller stays logged in when the caller is
+   * the account owner. When an administrator edits another user, all of
+   * that user's sessions are ended.
    *
    * @param request Authenticated request.
    * @param id User UUID.
@@ -198,7 +250,7 @@ export class UsersController {
   @ApiOperation({
     summary: 'Update a user',
     description:
-      'Updates the specified user account. Allowed for the account owner or an administrator.',
+      'Updates the specified user account. Allowed for the account owner or an administrator. Changing the password or the email ends the account\'s other sessions.',
   })
   @ApiParam({
     name: 'id',
@@ -215,8 +267,7 @@ export class UsersController {
     description: 'Missing or invalid access token.',
   })
   @ApiForbiddenResponse({
-    description:
-      'The caller is neither the account owner nor an administrator.',
+    description: 'The caller is neither the account owner nor an administrator.',
   })
   @ApiNotFoundResponse({
     description: 'User not found.',
@@ -231,7 +282,9 @@ export class UsersController {
   ): Promise<UserResponseDto> {
     this.assertSelfOrAdmin(request, id);
 
-    return this.usersService.update(id, updateUserDto);
+    const keepSessionId = request.user.id === id ? request.user.sid : undefined;
+
+    return this.usersService.update(id, updateUserDto, keepSessionId);
   }
 
   /**

@@ -1,134 +1,213 @@
 import {
   Body,
   Controller,
+  Header,
   HttpCode,
   HttpStatus,
   Post,
   Req,
+  Res,
+  UnauthorizedException,
 } from '@nestjs/common';
-
-import type { Request } from 'express';
-
+import { ConfigService } from '@nestjs/config';
 import {
-  ApiBadRequestResponse,
+  ApiBody,
   ApiOkResponse,
   ApiOperation,
   ApiTags,
+  ApiTooManyRequestsResponse,
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
+
+import type { CookieOptions, Request, Response } from 'express';
 
 import { AuthService } from './auth.service';
-import { LoginDto } from './dto/login.dto';
+import {
+  LOGIN_THROTTLE,
+  REFRESH_THROTTLE,
+  REFRESH_TOKEN_COOKIE,
+  REFRESH_TOKEN_TTL_MS,
+} from './constants/auth.constants';
 import { LoginResponseDto } from './dto/login-response.dto';
-import { RefreshTokenDto } from './dto/refresh-token.dto';
+import { LoginDto } from './dto/login.dto';
+import { RefreshResponseDto } from './dto/refresh-response.dto';
+import { RefreshTokenMismatchException } from './exceptions/refresh-token-mismatch.exception';
 
 /**
- * Authentication controller.
+ * Handles authentication endpoints.
  *
- * Handles HTTP requests related to user authentication.
+ * Access tokens are returned in the response body,
+ * while refresh tokens are stored in HttpOnly cookies.
  */
 @ApiTags('Authentication')
 @Controller('auth')
 export class AuthController {
   /**
-   * Injects AuthService to handle authentication logic.
-   *
-   * @param authService Service responsible for authentication.
+   * Options used when setting the refresh token cookie.
    */
-  constructor(private readonly authService: AuthService) {}
+  private readonly setCookieOptions: CookieOptions;
 
   /**
-   * Authenticates a user and returns a JWT access token.
+   * Options used when clearing the refresh token cookie. They must not
+   * contain maxAge: some Express versions let maxAge override the expiry
+   * date, which would keep the cookie instead of deleting it.
+   */
+  private readonly clearCookieOptions: CookieOptions;
+
+  /**
+   * Builds the cookie options from the configuration.
    *
-   * POST /auth/login
+   * @param authService Authentication business logic.
+   * @param configService Provides NODE_ENV (the cookie is Secure in production).
+   */
+  constructor(
+    private readonly authService: AuthService,
+    configService: ConfigService,
+  ) {
+    const baseOptions: CookieOptions = {
+      httpOnly: true,
+      secure: configService.get<string>('NODE_ENV') === 'production',
+      sameSite: 'lax',
+      path: '/auth',
+    };
+
+    this.setCookieOptions = { ...baseOptions, maxAge: REFRESH_TOKEN_TTL_MS };
+    this.clearCookieOptions = baseOptions;
+  }
+
+  /**
+   * Reads the refresh token from the cookie.
    *
-   * @param loginDto User login credentials.
-   * @param request Incoming HTTP request containing device information.
-   * @returns JWT access token and authenticated user information.
+   * @param request The request.
+   * @returns The refresh token, or undefined when there is none.
+   */
+  private readRefreshToken(request: Request): string | undefined {
+    const value = request.cookies?.[REFRESH_TOKEN_COOKIE] as unknown;
+
+    return typeof value === 'string' && value.length > 0 ? value : undefined;
+  }
+
+  /**
+   * Authenticates a user and creates a new session.
+   *
+   * The refresh token is stored in an HttpOnly cookie
+   * and is never exposed in the response body.
    */
   @Post('login')
+  @Throttle({ default: LOGIN_THROTTLE })
+  @Header('Cache-Control', 'no-store')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'User login',
-    description: 'Authenticates a user using email and password.',
-  })
-  @ApiOkResponse({
-    description: 'User authenticated successfully.',
-    type: LoginResponseDto,
-  })
-  @ApiBadRequestResponse({
-    description: 'Invalid login data.',
-  })
-  @ApiUnauthorizedResponse({
-    description: 'Invalid credentials or inactive account.',
-  })
-  login(
+  @ApiOperation({ summary: 'Authenticate a user' })
+  @ApiBody({ type: LoginDto })
+  @ApiOkResponse({ type: LoginResponseDto })
+  @ApiUnauthorizedResponse({ description: 'Invalid email or password.' })
+  @ApiTooManyRequestsResponse({ description: 'Too many login attempts.' })
+  async login(
     @Body() loginDto: LoginDto,
     @Req() request: Request,
-  ): Promise<LoginResponseDto> {
-    return this.authService.login(loginDto, {
-      userAgent: request.headers['user-agent'] ?? null,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const result = await this.authService.login(loginDto, {
+      userAgent: request.get('user-agent') ?? null,
       ipAddress: request.ip ?? null,
     });
+
+    response.cookie(
+      REFRESH_TOKEN_COOKIE,
+      result.refreshToken,
+      this.setCookieOptions,
+    );
+
+    return {
+      accessToken: result.accessToken,
+      user: result.user,
+    };
   }
 
   /**
-   * Refreshes authentication tokens.
+   * Renews authentication tokens using the refresh token cookie.
    *
-   * POST /auth/refresh
-   *
-   * @param refreshTokenDto Current refresh token.
-   * @returns Newly generated access and refresh tokens.
+   * The refresh token is rotated and the new token replaces the previous
+   * cookie. When the token was used right after a rotation (two tabs
+   * refreshing together), only a new access token is returned and the
+   * cookie is left alone. The cookie is cleared only when the session is
+   * definitely not valid (missing, expired, revoked, or a detected theft).
    */
   @Post('refresh')
+  @Throttle({ default: REFRESH_THROTTLE })
+  @Header('Cache-Control', 'no-store')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'Refresh authentication tokens',
-    description:
-      'Generates new access and refresh tokens using a valid refresh token.',
-  })
-  @ApiOkResponse({
-    description: 'Authentication tokens refreshed successfully.',
-  })
-  @ApiBadRequestResponse({
-    description: 'Invalid request data.',
-  })
+  @ApiOperation({ summary: 'Refresh authentication tokens' })
+  @ApiOkResponse({ type: RefreshResponseDto })
   @ApiUnauthorizedResponse({
-    description: 'Invalid, expired, or revoked refresh token.',
+    description: 'The refresh token is missing, invalid, expired or revoked.',
   })
-  refresh(@Body() refreshTokenDto: RefreshTokenDto): Promise<{
-    accessToken: string;
-    refreshToken: string;
-  }> {
-    return this.authService.refresh(refreshTokenDto.refreshToken);
+  @ApiTooManyRequestsResponse({ description: 'Too many refresh attempts.' })
+  async refresh(
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ): Promise<RefreshResponseDto> {
+    const refreshToken = this.readRefreshToken(request);
+
+    if (!refreshToken) {
+      response.clearCookie(REFRESH_TOKEN_COOKIE, this.clearCookieOptions);
+
+      throw new UnauthorizedException('Refresh token is missing.');
+    }
+
+    try {
+      const result = await this.authService.refresh(refreshToken);
+
+      if (result.refreshToken) {
+        response.cookie(
+          REFRESH_TOKEN_COOKIE,
+          result.refreshToken,
+          this.setCookieOptions,
+        );
+      }
+
+      return { accessToken: result.accessToken };
+    } catch (error) {
+      if (
+        error instanceof UnauthorizedException &&
+        !(error instanceof RefreshTokenMismatchException)
+      ) {
+        response.clearCookie(REFRESH_TOKEN_COOKIE, this.clearCookieOptions);
+      }
+
+      throw error;
+    }
   }
 
   /**
-   * Logs out the authenticated user.
+   * Logs out the current authentication session.
    *
-   * POST /auth/logout
-   *
-   * @param refreshTokenDto Current refresh token.
-   * @returns Logout confirmation message.
+   * The refresh token cookie is always cleared, and the call always
+   * succeeds, even if the token is missing, expired or invalid.
    */
   @Post('logout')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'Logout user',
-    description: 'Revokes the current refresh token and logs out the user.',
-  })
+  @ApiOperation({ summary: 'Log out the current session' })
   @ApiOkResponse({
-    description: 'User logged out successfully.',
+    schema: {
+      example: {
+        message: 'Logged out successfully.',
+      },
+    },
   })
-  @ApiBadRequestResponse({
-    description: 'Invalid request data.',
-  })
-  @ApiUnauthorizedResponse({
-    description: 'Invalid, expired, or already revoked refresh token.',
-  })
-  logout(
-    @Body() refreshTokenDto: RefreshTokenDto,
+  async logout(
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
   ): Promise<{ message: string }> {
-    return this.authService.logout(refreshTokenDto.refreshToken);
+    const refreshToken = this.readRefreshToken(request);
+
+    response.clearCookie(REFRESH_TOKEN_COOKIE, this.clearCookieOptions);
+
+    if (!refreshToken) {
+      return { message: 'Logged out successfully.' };
+    }
+
+    return this.authService.logout(refreshToken);
   }
 }
